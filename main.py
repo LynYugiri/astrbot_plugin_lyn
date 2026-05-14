@@ -17,6 +17,10 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
+class DownloadSizeLimitExceeded(Exception):
+    pass
+
+
 @register("astrbot_plugin_jm", "Lemoec", "下载 JM 漫画并转换为 PDF 发送", "2.0.0")
 class JmPlugin(Star):
     jm_help_msg = "使用方式: /jm <漫画ID>"
@@ -24,6 +28,7 @@ class JmPlugin(Star):
     jm_failed_msg = "hentai！一天到晚看本子真是没救了喵"
     cleanup_interval_seconds = 24 * 60 * 60
     download_ttl_seconds = 24 * 60 * 60
+    max_download_bytes = 150 * 1024 * 1024
     search_limit = 10
 
     def __init__(self, context: Context):
@@ -122,7 +127,12 @@ class JmPlugin(Star):
         option_file = album_pdf_dir / "jm_option.yml"
         self._write_option_file(option_file, album_pdf_dir, album_pdf_dir / "images")
         option = jmcomic.create_option_by_file(str(option_file))
-        jmcomic.download_album(comic_id, option)
+        downloader = self._limited_downloader_class(album_pdf_dir)
+        try:
+            jmcomic.download_album(comic_id, option, downloader=downloader)
+        except DownloadSizeLimitExceeded:
+            shutil.rmtree(album_pdf_dir, ignore_errors=True)
+            raise RuntimeError("漫画文件超过 150MB，已停止下载") from None
 
         pdf_files = sorted(
             album_pdf_dir.glob("*.pdf"),
@@ -131,7 +141,39 @@ class JmPlugin(Star):
         )
         if not pdf_files:
             raise FileNotFoundError(f"JM{comic_id} 未生成 PDF")
+        if pdf_files[0].stat().st_size > self.max_download_bytes:
+            shutil.rmtree(album_pdf_dir, ignore_errors=True)
+            raise RuntimeError("漫画文件超过 150MB，已停止下载")
         return pdf_files[0]
+
+    def _limited_downloader_class(self, download_dir: Path):
+        max_bytes = self.max_download_bytes
+
+        class LimitedDownloader(jmcomic.JmDownloader):
+            def before_image(self, image, img_save_path):
+                self._raise_if_too_large()
+                return super().before_image(image, img_save_path)
+
+            def after_image(self, image, img_save_path):
+                result = super().after_image(image, img_save_path)
+                self._raise_if_too_large()
+                return result
+
+            def after_album(self, album):
+                self._raise_if_too_large()
+                return super().after_album(album)
+
+            def _raise_if_too_large(self) -> None:
+                total_size = 0
+                for path in download_dir.rglob("*"):
+                    if not path.is_file():
+                        continue
+                    with contextlib.suppress(OSError):
+                        total_size += path.stat().st_size
+                    if total_size > max_bytes:
+                        raise DownloadSizeLimitExceeded
+
+        return LimitedDownloader
 
     def _has_img2pdf(self) -> bool:
         return importlib.util.find_spec("img2pdf") is not None
