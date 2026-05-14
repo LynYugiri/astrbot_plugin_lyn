@@ -191,6 +191,9 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Local AstrBot runtime data created during plugin import/debugging
+data/
+
 # PyPI configuration file
 .pypirc
 
