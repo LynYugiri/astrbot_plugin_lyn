@@ -28,7 +28,7 @@ class JmPlugin(Star):
 
     def __init__(self, context: Context):
         super().__init__(context)
-        self.data_dir = get_astrbot_data_path() / "plugin_data" / "astrbot_plugin_jm"
+        self.data_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_jm"
         self.pdf_root = self.data_dir / "pdf"
         self.option_file = self.data_dir / "jm_option.yml"
         self._download_locks: dict[int, asyncio.Lock] = {}
@@ -51,8 +51,9 @@ class JmPlugin(Star):
 
         yield event.plain_result(f"开始下载 JM{comic_id}，PDF 生成可能需要一段时间。")
 
+        lock = self._lock_for(comic_id)
         try:
-            async with self._lock_for(comic_id):
+            async with lock:
                 pdf_path = await asyncio.to_thread(self._download_pdf, comic_id)
         except Exception as exc:
             logger.exception(f"JM{comic_id} 下载失败: {exc}")
@@ -76,7 +77,7 @@ class JmPlugin(Star):
             result = await asyncio.to_thread(self._search, keywords)
         except Exception as exc:
             logger.exception(f"JM 搜索失败: {exc}")
-            yield event.plain_result(f"搜索漫画失败: {exc}\n{self.jm_search_help_msg}")
+            yield event.plain_result(f"{self.jm_failed_msg}\n搜索漫画失败: {exc}\n{self.jm_search_help_msg}")
             return
 
         yield event.plain_result(result)
@@ -137,7 +138,10 @@ class JmPlugin(Star):
 
     async def _cleanup_loop(self) -> None:
         while True:
-            await asyncio.to_thread(self._cleanup_downloads)
+            try:
+                await asyncio.to_thread(self._cleanup_downloads)
+            except Exception as exc:
+                logger.warning(f"JM 下载数据清理失败: {exc}")
             await asyncio.sleep(self.cleanup_interval_seconds)
 
     def _cleanup_downloads(self) -> None:
@@ -145,25 +149,29 @@ class JmPlugin(Star):
             return
 
         expire_before = time.time() - self.download_ttl_seconds
-        for album_dir in self.pdf_root.iterdir():
+        for album_dir in list(self.pdf_root.iterdir()):
             if not album_dir.is_dir():
                 continue
 
-            for task_dir in album_dir.iterdir():
-                if task_dir.is_dir() and task_dir.stat().st_mtime < expire_before:
+            for task_dir in list(album_dir.iterdir()):
+                if not task_dir.is_dir():
+                    continue
+
+                with contextlib.suppress(OSError):
+                    if task_dir.stat().st_mtime >= expire_before:
+                        continue
                     shutil.rmtree(task_dir, ignore_errors=True)
 
             with contextlib.suppress(OSError):
-                next(album_dir.iterdir())
-                continue
-            album_dir.rmdir()
+                if not any(album_dir.iterdir()):
+                    album_dir.rmdir()
 
     def _search(self, keywords: str) -> str:
         query = " +".join(keywords.split())
         client = jmcomic.JmOption.default().new_jm_client()
         page = client.search_site(query, 1)
         if not page or page.page_size <= 0:
-            return f"没有找到与'{keywords}'相关的漫画。\n{self.jm_search_help_msg}"
+            return f"{self.jm_failed_msg}\n没有找到与'{keywords}'相关的漫画。\n{self.jm_search_help_msg}"
 
         lines = [f"搜索结果: {keywords}", "----------"]
         for index, (album_id, title) in enumerate(page):
