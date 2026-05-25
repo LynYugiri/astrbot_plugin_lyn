@@ -163,7 +163,7 @@ class JmPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def auto_convert_video_link(self, event: AstrMessageEvent):
-        """自动把视频平台链接或 QQ 小程序卡片转换为可复制链接。"""
+        """自动解析视频平台链接或 QQ 小程序卡片，并回复媒体信息。"""
         if self._is_command_message(event.message_str):
             return
 
@@ -171,16 +171,16 @@ class JmPlugin(Star):
         if not raw_urls:
             return
 
-        converted = []
+        summaries = []
         seen = set()
         for raw_url in raw_urls:
-            url = await asyncio.to_thread(self._normalize_video_url, raw_url)
-            if url and url not in seen:
-                seen.add(url)
-                converted.append(url)
+            summary = await asyncio.to_thread(self._describe_media_url, raw_url)
+            if summary and summary not in seen:
+                seen.add(summary)
+                summaries.append(summary)
 
-        if converted:
-            yield event.plain_result("\n".join(["已转换链接:", *converted]))
+        if summaries:
+            yield event.plain_result("\n\n".join(summaries))
 
     def _lock_for(self, comic_id: int) -> asyncio.Lock:
         lock = self._download_locks.get(comic_id)
@@ -382,6 +382,170 @@ class JmPlugin(Star):
             return None
         normalized = self._normalize_video_url(urls[0])
         return normalized or urls[0]
+
+    def _get_video_info_safe(self, url: str) -> dict | None:
+        try:
+            import yt_dlp
+        except ImportError:
+            return None
+
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "nocheckcertificate": True,
+            "noplaylist": True,
+            "skip_download": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(options) as downloader:
+                return downloader.extract_info(url, download=False)
+        except Exception as exc:
+            logger.warning(f"视频信息解析失败: {exc}")
+            return None
+
+    def _describe_media_url(self, raw_url: str) -> str | None:
+        url = self._normalize_video_url(raw_url)
+        if not url:
+            return None
+
+        info = self._get_video_info_safe(url)
+        if not info:
+            return "\n".join([url, "媒体信息解析失败，请确认 yt-dlp 已安装或稍后重试。"])
+
+        page_url = self._canonical_media_url(url, info)
+        if self._is_bilibili_host(urlparse(page_url).netloc):
+            return self._format_bilibili_summary(page_url, info)
+
+        return self._format_generic_media_summary(page_url, info)
+
+    def _format_bilibili_summary(self, page_url: str, info: dict) -> str:
+        title = info.get("title") or "未知标题"
+        uploader = info.get("uploader") or info.get("channel") or "未知"
+        uploader_url = info.get("uploader_url") or self._bilibili_space_url(info)
+        category = self._first_text(info.get("categories")) or info.get("category") or info.get("genre") or ""
+        description = self._format_description(info.get("description"))
+        lines = [
+            page_url,
+            f"标题：{title}",
+            f"类型：{category} | UP：{uploader} | {uploader_url}",
+            "",
+            (
+                f"播放：{self._format_count(info.get('view_count'))} | "
+                f"弹幕：{self._format_count(info.get('danmaku_count') or info.get('comment_count_danmaku'))} | "
+                f"收藏：{self._format_count(info.get('favorite_count'))}"
+            ),
+            (
+                f"点赞：{self._format_count(info.get('like_count'))} | "
+                f"硬币：{self._format_count(info.get('coin_count'))} | "
+                f"评论：{self._format_count(info.get('comment_count'))}"
+            ),
+            f"简介：{description}",
+        ]
+        return "\n".join(lines)
+
+    def _format_generic_media_summary(self, page_url: str, info: dict) -> str:
+        title = info.get("title") or "未知标题"
+        uploader = info.get("uploader") or info.get("channel") or "未知"
+        duration = self._format_duration(info.get("duration"))
+        filesize = self._format_size(info.get("filesize") or info.get("filesize_approx"))
+        description = self._format_description(info.get("description"))
+        lines = [
+            page_url,
+            f"标题：{title}",
+            f"作者：{uploader}",
+            f"时长：{duration} | 大小：{filesize}",
+            f"简介：{description}",
+        ]
+
+        best_combined, best_video, best_audio = self._select_best_formats(info.get("formats", []))
+        if best_combined:
+            lines.append(f"最佳合并流：{self._format_stream_info(best_combined)}")
+        elif info.get("url"):
+            lines.append("最佳合并流：可用")
+        else:
+            lines.append("最佳合并流：无")
+
+        lines.append(f"最佳视频流：{self._format_stream_info(best_video) if best_video else '无'}")
+        lines.append(f"最佳音频流：{self._format_stream_info(best_audio) if best_audio else '无'}")
+        return "\n".join(lines)
+
+    def _bilibili_space_url(self, info: dict) -> str:
+        uploader_id = info.get("uploader_id") or info.get("channel_id")
+        return f"https://space.bilibili.com/{uploader_id}" if uploader_id else ""
+
+    def _first_text(self, value: object) -> str:
+        if isinstance(value, list) and value:
+            return str(value[0])
+        if isinstance(value, str):
+            return value
+        return ""
+
+    def _format_count(self, value: int | float | None) -> str:
+        if value is None:
+            return "未知"
+        number = float(value)
+        if number >= 10000:
+            return f"{number / 10000:.2f}万"
+        return str(int(number))
+
+    def _format_description(self, description: object) -> str:
+        if not description:
+            return "无"
+        text = str(description).strip().replace("\r", "").replace("\n", " ")
+        return text[:200] + "..." if len(text) > 200 else text
+
+    def _canonical_media_url(self, fallback_url: str, info: dict) -> str:
+        for value in (info.get("webpage_url"), info.get("original_url"), fallback_url):
+            if not value:
+                continue
+            normalized = self._normalize_video_url(str(value))
+            if normalized:
+                return normalized
+        return fallback_url
+
+    def _select_best_formats(self, formats: list[dict]) -> tuple[dict | None, dict | None, dict | None]:
+        best_combined = None
+        best_video = None
+        best_audio = None
+        for item in formats:
+            vcodec = item.get("vcodec", "none")
+            acodec = item.get("acodec", "none")
+            if vcodec != "none" and acodec != "none":
+                best_combined = item
+            elif vcodec != "none" and acodec == "none":
+                best_video = item
+            elif vcodec == "none" and acodec != "none":
+                best_audio = item
+        return best_combined, best_video, best_audio
+
+    def _format_stream_info(self, info: dict) -> str:
+        width = info.get("width") or "?"
+        height = info.get("height") or "?"
+        ext = info.get("ext") or "?"
+        vcodec = info.get("vcodec") or "?"
+        acodec = info.get("acodec") or "?"
+        filesize = self._format_size(info.get("filesize") or info.get("filesize_approx"))
+        return f"{width}x{height}, {ext}, v:{vcodec}, a:{acodec}, {filesize}"
+
+    def _format_size(self, size_bytes: int | float | None) -> str:
+        if not size_bytes:
+            return "未知"
+        size = float(size_bytes)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{size:.2f} {unit}" if unit != "B" else f"{int(size)} B"
+            size /= 1024
+        return "未知"
+
+    def _format_duration(self, duration: int | float | None) -> str:
+        if not duration:
+            return "未知"
+        seconds = int(duration)
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes}:{seconds:02d}"
 
     def _download_video_file(self, url: str) -> Path:
         try:
