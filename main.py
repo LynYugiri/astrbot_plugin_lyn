@@ -27,7 +27,7 @@ class DownloadSizeLimitExceeded(Exception):
     pass
 
 
-@register("astrbot_plugin_lyn", "Lemoec", "下载 JM 漫画并转换为 PDF 发送", "2.0.0")
+@register("astrbot_plugin_lyn", "Lemoec", "下载 JM 漫画并转换为 PDF 发送", "2.1.0")
 class JmPlugin(Star):
     jm_help_msg = "使用方式: /jm <漫画ID>"
     jm_search_help_msg = "使用方式: /jm搜索 <关键词1> <关键词2>..."
@@ -37,7 +37,8 @@ class JmPlugin(Star):
     download_ttl_seconds = 24 * 60 * 60
     max_download_bytes = 150 * 1024 * 1024
     search_limit = 10
-    pixiv_max_pages = 50
+    pixiv_max_pages = 500
+    pixiv_forward_chunk_size = 42
     pixiv_extensions = ("png", "jpg", "gif")
     video_max_size_bytes = 100 * 1024 * 1024
     video_url_pattern = re.compile(r"https?://[^\s\])}>\"'，。！？、；]+", re.IGNORECASE)
@@ -603,13 +604,20 @@ class JmPlugin(Star):
 
     async def _delete_later(self, path: Path, delay_seconds: int) -> None:
         await asyncio.sleep(delay_seconds)
+        parent = path.parent
+        if parent != self.video_root and self._is_relative_to(parent, self.video_root):
+            shutil.rmtree(parent, ignore_errors=True)
+            return
+
         with contextlib.suppress(OSError):
             if path.exists():
                 path.unlink()
-        with contextlib.suppress(OSError):
-            parent = path.parent
-            if parent != self.video_root and parent.exists() and not any(parent.iterdir()):
-                parent.rmdir()
+
+    def _is_relative_to(self, path: Path, parent: Path) -> bool:
+        with contextlib.suppress(ValueError):
+            path.relative_to(parent)
+            return True
+        return False
 
     def _extract_message_urls(self, event: AstrMessageEvent) -> list[str]:
         urls = self._extract_urls_from_text(event.message_str)
@@ -688,7 +696,10 @@ class JmPlugin(Star):
 
     def _is_video_platform_url(self, url: str) -> bool:
         host = urlparse(url).netloc.lower()
-        return any(host == domain or host.endswith(f".{domain}") for domain in self.video_domains)
+        return any(self._is_domain(host, domain) for domain in self.video_domains)
+
+    def _is_domain(self, host: str, domain: str) -> bool:
+        return host == domain or host.endswith(f".{domain}")
 
     def _normalize_bilibili_url(self, url: str) -> str | None:
         parsed = urlparse(url)
@@ -751,7 +762,7 @@ class JmPlugin(Star):
 
     def _is_bilibili_host(self, host: str) -> bool:
         host = host.lower()
-        return host == "b23.tv" or host.endswith("bilibili.com")
+        return self._is_domain(host, "b23.tv") or self._is_domain(host, "bilibili.com")
 
     def _av_to_bv(self, avid: int) -> str:
         table = "fZodR9XQDSUm21yCkr6zBqiveYah8btxsWpHnJE7jL5VG3guMTKNPAwcF"
@@ -847,21 +858,23 @@ class JmPlugin(Star):
         sender_id: str,
         image_urls: list[str],
     ) -> None:
-        nodes = [
-            Comp.Node(
-                uin=event.get_self_id() or "0",
-                name="Pixiv",
-                content=[Comp.Image.fromURL(url)],
+        for start in range(0, len(image_urls), self.pixiv_forward_chunk_size):
+            urls = image_urls[start:start + self.pixiv_forward_chunk_size]
+            nodes = [
+                Comp.Node(
+                    uin=event.get_self_id() or "0",
+                    name="Pixiv",
+                    content=[Comp.Image.fromURL(url)],
+                )
+                for url in urls
+            ]
+            chain = MessageChain([Comp.Nodes(nodes)])
+            await event.send_message(
+                bot=event.bot,
+                message_chain=chain,
+                is_group=False,
+                session_id=sender_id,
             )
-            for url in image_urls
-        ]
-        chain = MessageChain([Comp.Nodes(nodes)])
-        await event.send_message(
-            bot=event.bot,
-            message_chain=chain,
-            is_group=False,
-            session_id=sender_id,
-        )
 
     async def terminate(self):
         if self._cleanup_task is not None:

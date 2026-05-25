@@ -1,6 +1,6 @@
 name: astrbot_plugin_lyn
 display_name: Lyn Tools
 desc: JM PDF 下载、Pixiv 图片私信、视频链接转换和视频下载工具。
-version: v2.0.0
+version: v2.1.0
 author: Lemoec
 repo: https://github.com/LynYugiri/astrbot_plugin_lyn
