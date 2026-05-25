@@ -171,16 +171,18 @@ class JmPlugin(Star):
         if not raw_urls:
             return
 
-        summaries = []
+        chain = []
         seen = set()
         for raw_url in raw_urls:
             summary = await asyncio.to_thread(self._describe_media_url, raw_url)
-            if summary and summary not in seen:
-                seen.add(summary)
-                summaries.append(summary)
+            if summary and summary[0] not in seen:
+                seen.add(summary[0])
+                if summary[1]:
+                    chain.append(Comp.Image.fromURL(summary[1]))
+                chain.append(Comp.Plain(summary[0]))
 
-        if summaries:
-            yield event.plain_result("\n\n".join(summaries))
+        if chain:
+            yield event.chain_result(chain)
 
     def _lock_for(self, comic_id: int) -> asyncio.Lock:
         lock = self._download_locks.get(comic_id)
@@ -403,20 +405,21 @@ class JmPlugin(Star):
             logger.warning(f"视频信息解析失败: {exc}")
             return None
 
-    def _describe_media_url(self, raw_url: str) -> str | None:
+    def _describe_media_url(self, raw_url: str) -> tuple[str, str | None] | None:
         url = self._normalize_video_url(raw_url)
         if not url:
             return None
 
         info = self._get_video_info_safe(url)
         if not info:
-            return "\n".join([url, "媒体信息解析失败，请确认 yt-dlp 已安装或稍后重试。"])
+            return "\n".join([url, "媒体信息解析失败，请确认 yt-dlp 已安装或稍后重试。"]), None
 
         page_url = self._canonical_media_url(url, info)
+        cover_url = self._media_cover_url(info)
         if self._is_bilibili_host(urlparse(page_url).netloc):
-            return self._format_bilibili_summary(page_url, info)
+            return self._format_bilibili_summary(page_url, info), cover_url
 
-        return self._format_generic_media_summary(page_url, info)
+        return self._format_generic_media_summary(page_url, info), cover_url
 
     def _format_bilibili_summary(self, page_url: str, info: dict) -> str:
         title = info.get("title") or "未知标题"
@@ -424,10 +427,11 @@ class JmPlugin(Star):
         uploader_url = info.get("uploader_url") or self._bilibili_space_url(info)
         category = self._first_text(info.get("categories")) or info.get("category") or info.get("genre") or ""
         description = self._format_description(info.get("description"))
-        lines = [
-            page_url,
-            f"标题：{title}",
-            f"类型：{category} | UP：{uploader} | {uploader_url}",
+        lines = [page_url, f"标题：{title}"]
+        if category:
+            lines.append(f"类型：{category}")
+        lines.extend([
+            f"UP：{uploader} | {uploader_url}" if uploader_url else f"UP：{uploader}",
             "",
             (
                 f"播放：{self._format_count(info.get('view_count'))} | "
@@ -440,8 +444,23 @@ class JmPlugin(Star):
                 f"评论：{self._format_count(info.get('comment_count'))}"
             ),
             f"简介：{description}",
-        ]
+        ])
         return "\n".join(lines)
+
+    def _media_cover_url(self, info: dict) -> str | None:
+        for key in ("thumbnail", "display_id", "cover"):
+            value = info.get(key)
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                return value
+        thumbnails = info.get("thumbnails")
+        if isinstance(thumbnails, list):
+            for item in reversed(thumbnails):
+                if not isinstance(item, dict):
+                    continue
+                value = item.get("url")
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    return value
+        return None
 
     def _format_generic_media_summary(self, page_url: str, info: dict) -> str:
         title = info.get("title") or "未知标题"
