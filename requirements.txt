@@ -1,3 +1,5 @@
 git+https://github.com/hect0x7/JMComic-Crawler-Python.git#egg=jmcomic
 img2pdf
 PyYAML
+yt-dlp
+imageio-ffmpeg

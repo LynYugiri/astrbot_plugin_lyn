@@ -1,6 +1,6 @@
-name: astrbot_plugin_jm
+name: astrbot_plugin_lyn
 display_name: JM PDF Downloader
 desc: 下载 JM 漫画，转换为 PDF 并发送文件。
 version: v2.0.0
 author: Lemoec
-repo: https://github.com/LynYugiri/astrbot_plugin_jm
+repo: https://github.com/LynYugiri/astrbot_plugin_lyn
