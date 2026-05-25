@@ -1,6 +1,6 @@
 name: astrbot_plugin_lyn
-display_name: JM PDF Downloader
-desc: 下载 JM 漫画，转换为 PDF 并发送文件。
+display_name: Lyn Tools
+desc: JM PDF 下载、Pixiv 图片私信、视频链接转换和视频下载工具。
 version: v2.0.0
 author: Lemoec
 repo: https://github.com/LynYugiri/astrbot_plugin_lyn
