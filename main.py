@@ -36,6 +36,7 @@ class JmPlugin(Star):
     cleanup_interval_seconds = 24 * 60 * 60
     download_ttl_seconds = 24 * 60 * 60
     max_download_bytes = 150 * 1024 * 1024
+    pixiv_max_download_bytes = 150 * 1024 * 1024
     search_limit = 10
     pixiv_max_pages = 500
     pixiv_forward_chunk_size = 42
@@ -61,6 +62,7 @@ class JmPlugin(Star):
         super().__init__(context)
         self.data_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_lyn"
         self.pdf_root = self.data_dir / "pdf"
+        self.pixiv_root = self.data_dir / "pixiv"
         self.video_root = self.data_dir / "video"
         self.option_file = self.data_dir / "jm_option.yml"
         self._download_locks: dict[int, asyncio.Lock] = {}
@@ -68,6 +70,7 @@ class JmPlugin(Star):
 
     async def initialize(self):
         self.pdf_root.mkdir(parents=True, exist_ok=True)
+        self.pixiv_root.mkdir(parents=True, exist_ok=True)
         self.video_root.mkdir(parents=True, exist_ok=True)
         self._write_option_file(self.option_file, self.pdf_root)
         if not self._has_img2pdf():
@@ -134,8 +137,8 @@ class JmPlugin(Star):
 
         yield event.plain_result(f"正在获取 Pixiv {pixiv_id}，稍后会私信发送。")
         try:
-            image_urls = await asyncio.to_thread(self._resolve_pixiv_images, pixiv_id)
-            await self._send_pixiv_private_forward(event, sender_id, image_urls)
+            image_paths = await asyncio.to_thread(self._download_pixiv_images, pixiv_id)
+            await self._send_pixiv_private_forward(event, sender_id, image_paths)
         except Exception as exc:
             logger.exception(f"Pixiv {pixiv_id} 获取或发送失败: {exc}")
             yield event.plain_result(f"Pixiv {pixiv_id} 获取或发送失败：{exc}")
@@ -231,6 +234,9 @@ class JmPlugin(Star):
         except DownloadSizeLimitExceeded:
             shutil.rmtree(album_pdf_dir, ignore_errors=True)
             raise RuntimeError("漫画文件超过 150MB，已停止下载") from None
+        except Exception:
+            shutil.rmtree(album_pdf_dir, ignore_errors=True)
+            raise
 
         pdf_files = sorted(
             album_pdf_dir.glob("*.pdf"),
@@ -238,6 +244,7 @@ class JmPlugin(Star):
             reverse=True,
         )
         if not pdf_files:
+            shutil.rmtree(album_pdf_dir, ignore_errors=True)
             raise FileNotFoundError(f"JM{comic_id} 未生成 PDF")
         if pdf_files[0].stat().st_size > self.max_download_bytes:
             shutil.rmtree(album_pdf_dir, ignore_errors=True)
@@ -281,10 +288,15 @@ class JmPlugin(Star):
             try:
                 await asyncio.to_thread(self._cleanup_downloads)
             except Exception as exc:
-                logger.warning(f"JM 下载数据清理失败: {exc}")
+                logger.warning(f"下载缓存清理失败: {exc}")
             await asyncio.sleep(self.cleanup_interval_seconds)
 
     def _cleanup_downloads(self) -> None:
+        self._cleanup_pdf_downloads()
+        self._cleanup_pixiv_downloads()
+        self._cleanup_video_downloads()
+
+    def _cleanup_pdf_downloads(self) -> None:
         if not self.pdf_root.exists():
             return
 
@@ -305,6 +317,42 @@ class JmPlugin(Star):
             with contextlib.suppress(OSError):
                 if not any(album_dir.iterdir()):
                     album_dir.rmdir()
+
+    def _cleanup_pixiv_downloads(self) -> None:
+        if not self.pixiv_root.exists():
+            return
+
+        expire_before = time.time() - self.download_ttl_seconds
+        for pixiv_dir in list(self.pixiv_root.iterdir()):
+            if not pixiv_dir.is_dir():
+                continue
+
+            for task_dir in list(pixiv_dir.iterdir()):
+                if not task_dir.is_dir():
+                    continue
+
+                with contextlib.suppress(OSError):
+                    if task_dir.stat().st_mtime >= expire_before:
+                        continue
+                    shutil.rmtree(task_dir, ignore_errors=True)
+
+            with contextlib.suppress(OSError):
+                if not any(pixiv_dir.iterdir()):
+                    pixiv_dir.rmdir()
+
+    def _cleanup_video_downloads(self) -> None:
+        if not self.video_root.exists():
+            return
+
+        expire_before = time.time() - self.download_ttl_seconds
+        for task_dir in list(self.video_root.iterdir()):
+            if not task_dir.is_dir():
+                continue
+
+            with contextlib.suppress(OSError):
+                if task_dir.stat().st_mtime >= expire_before:
+                    continue
+                shutil.rmtree(task_dir, ignore_errors=True)
 
     def _search(self, keywords: str) -> str:
         query = " +".join(keywords.split())
@@ -477,7 +525,8 @@ class JmPlugin(Star):
             f"简介：{description}",
         ]
 
-        best_combined, best_video, best_audio = self._select_best_formats(info.get("formats", []))
+        formats = info.get("formats")
+        best_combined, best_video, best_audio = self._select_best_formats(formats if isinstance(formats, list) else [])
         if best_combined:
             lines.append(f"最佳合并流：{self._format_stream_info(best_combined)}")
         elif info.get("url"):
@@ -584,12 +633,17 @@ class JmPlugin(Star):
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
+            "max_filesize": self.video_max_size_bytes,
             "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
         }
 
-        with yt_dlp.YoutubeDL(options) as downloader:
-            info = downloader.extract_info(url, download=True)
-            downloaded = Path(downloader.prepare_filename(info))
+        try:
+            with yt_dlp.YoutubeDL(options) as downloader:
+                info = downloader.extract_info(url, download=True)
+                downloaded = Path(downloader.prepare_filename(info))
+        except Exception:
+            shutil.rmtree(task_dir, ignore_errors=True)
+            raise
 
         mp4_files = sorted(task_dir.glob("*.mp4"), key=lambda path: path.stat().st_mtime, reverse=True)
         if mp4_files:
@@ -599,6 +653,7 @@ class JmPlugin(Star):
 
         files = sorted((path for path in task_dir.iterdir() if path.is_file()), key=lambda path: path.stat().st_mtime, reverse=True)
         if not files:
+            shutil.rmtree(task_dir, ignore_errors=True)
             raise FileNotFoundError("视频下载完成但未找到输出文件")
         return files[0]
 
@@ -824,6 +879,64 @@ class JmPlugin(Star):
             raise FileNotFoundError("未找到图片，请确认 PixivID 存在且 pixiv.re 可访问")
         return image_urls
 
+    def _download_pixiv_images(self, pixiv_id: str) -> list[Path]:
+        image_urls = self._resolve_pixiv_images(pixiv_id)
+        pixiv_dir = self.pixiv_root / pixiv_id / uuid.uuid4().hex
+        pixiv_dir.mkdir(parents=True, exist_ok=True)
+
+        image_paths: list[Path] = []
+        total_size = 0
+        try:
+            for index, url in enumerate(image_urls, start=1):
+                path = pixiv_dir / f"{index:03d}.{self._pixiv_url_extension(url)}"
+                total_size += self._download_pixiv_image(url, path, self.pixiv_max_download_bytes - total_size)
+                image_paths.append(path)
+        except Exception:
+            shutil.rmtree(pixiv_dir, ignore_errors=True)
+            raise
+
+        return image_paths
+
+    def _pixiv_url_extension(self, url: str) -> str:
+        extension = Path(urlparse(url).path).suffix.lower().lstrip(".")
+        return extension if extension in self.pixiv_extensions else "jpg"
+
+    def _download_pixiv_image(self, url: str, path: Path, max_bytes: int) -> int:
+        if max_bytes <= 0:
+            raise RuntimeError("Pixiv 图片总大小超过 150MB，已停止下载")
+
+        request = urllib.request.Request(url, headers={"User-Agent": "AstrBot/astrbot_plugin_lyn"})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                if response.status < 200 or response.status >= 400:
+                    raise RuntimeError(f"图片下载失败 HTTP {response.status}: {url}")
+                if response.headers.get_content_maintype() != "image":
+                    raise RuntimeError(f"链接返回的不是图片: {url}")
+                content_length = response.headers.get("Content-Length")
+                if self._exceeds_max_bytes(content_length, max_bytes):
+                    raise RuntimeError("Pixiv 图片总大小超过 150MB，已停止下载")
+
+                downloaded = 0
+                with path.open("wb") as file:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            raise RuntimeError("Pixiv 图片总大小超过 150MB，已停止下载")
+                        file.write(chunk)
+                return downloaded
+        except (OSError, urllib.error.URLError) as exc:
+            raise RuntimeError(f"图片下载失败: {url}") from exc
+
+    def _exceeds_max_bytes(self, content_length: str | None, max_bytes: int) -> bool:
+        if not content_length:
+            return False
+        with contextlib.suppress(ValueError):
+            return int(content_length) > max_bytes
+        return False
+
     def _first_existing_pixiv_url(self, pixiv_name: str) -> str | None:
         for extension in self.pixiv_extensions:
             url = f"https://pixiv.re/{pixiv_name}.{extension}"
@@ -856,22 +969,40 @@ class JmPlugin(Star):
         self,
         event: AstrMessageEvent,
         sender_id: str,
-        image_urls: list[str],
+        image_paths: list[Path],
     ) -> None:
-        for start in range(0, len(image_urls), self.pixiv_forward_chunk_size):
-            urls = image_urls[start:start + self.pixiv_forward_chunk_size]
+        for start in range(0, len(image_paths), self.pixiv_forward_chunk_size):
+            paths = image_paths[start:start + self.pixiv_forward_chunk_size]
             nodes = [
                 Comp.Node(
                     uin=event.get_self_id() or "0",
                     name="Pixiv",
-                    content=[Comp.Image.fromURL(url)],
+                    content=[Comp.Image.fromFileSystem(str(path))],
                 )
-                for url in urls
+                for path in paths
             ]
             chain = MessageChain([Comp.Nodes(nodes)])
+            try:
+                await event.send_message(
+                    bot=event.bot,
+                    message_chain=chain,
+                    is_group=False,
+                    session_id=sender_id,
+                )
+            except Exception as exc:
+                logger.warning(f"Pixiv 合并转发发送失败，改为逐张发送: {exc}")
+                await self._send_pixiv_private_images(event, sender_id, paths)
+
+    async def _send_pixiv_private_images(
+        self,
+        event: AstrMessageEvent,
+        sender_id: str,
+        image_paths: list[Path],
+    ) -> None:
+        for path in image_paths:
             await event.send_message(
                 bot=event.bot,
-                message_chain=chain,
+                message_chain=MessageChain([Comp.Image.fromFileSystem(str(path))]),
                 is_group=False,
                 session_id=sender_id,
             )
