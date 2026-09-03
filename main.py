@@ -201,7 +201,9 @@ class JmPlugin(Star):
             )
 
         if nodes:
-            yield event.chain_result([Comp.Nodes(nodes)])
+            # 直接发送 Node 组件链。aiocqhttp 适配器会为每个 Node 调用
+            # send_group_forward_msg / send_private_forward_msg，生成聊天记录。
+            yield event.chain_result(nodes)
 
     def _lock_for(self, comic_id: int) -> asyncio.Lock:
         lock = self._download_locks.get(comic_id)
