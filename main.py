@@ -27,7 +27,7 @@ class DownloadSizeLimitExceeded(Exception):
     pass
 
 
-@register("astrbot_plugin_lyn", "Lemoec", "下载 JM 漫画并转换为 PDF 发送", "2.1.0")
+@register("astrbot_plugin_lyn", "Lemoec", "下载 JM 漫画并转换为 PDF 发送", "2.2.0")
 class JmPlugin(Star):
     jm_help_msg = "使用方式: /jm <漫画ID>"
     jm_search_help_msg = "使用方式: /jm搜索 <关键词1> <关键词2>..."
@@ -54,8 +54,13 @@ class JmPlugin(Star):
         "twitter.com",
         "tiktok.com",
         "douyin.com",
+        "iesdouyin.com",
         "kuaishou.com",
         "vimeo.com",
+    )
+    http_user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     )
 
     def __init__(self, context: Context):
@@ -175,18 +180,28 @@ class JmPlugin(Star):
         if not raw_urls:
             return
 
-        chain = []
+        nodes = []
         seen = set()
         for raw_url in raw_urls:
             summary = await asyncio.to_thread(self._describe_media_url, raw_url)
-            if summary and summary[0] not in seen:
-                seen.add(summary[0])
-                if summary[1]:
-                    chain.append(Comp.Image.fromURL(summary[1]))
-                chain.append(Comp.Plain(summary[0]))
+            if not summary or summary[0] in seen:
+                continue
 
-        if chain:
-            yield event.chain_result(chain)
+            seen.add(summary[0])
+            content = []
+            if summary[1]:
+                content.append(Comp.Image.fromURL(summary[1]))
+            content.append(Comp.Plain(summary[0]))
+            nodes.append(
+                Comp.Node(
+                    uin=event.get_self_id() or "0",
+                    name="媒体解析",
+                    content=content,
+                )
+            )
+
+        if nodes:
+            yield event.chain_result([Comp.Nodes(nodes)])
 
     def _lock_for(self, comic_id: int) -> asyncio.Lock:
         lock = self._download_locks.get(comic_id)
@@ -446,6 +461,12 @@ class JmPlugin(Star):
             "nocheckcertificate": True,
             "noplaylist": True,
             "skip_download": True,
+            "socket_timeout": 20,
+            "retries": 3,
+            "http_headers": {
+                "User-Agent": self.http_user_agent,
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
         }
         try:
             with yt_dlp.YoutubeDL(options) as downloader:
@@ -560,8 +581,7 @@ class JmPlugin(Star):
     def _format_description(self, description: object) -> str:
         if not description:
             return "无"
-        text = str(description).strip().replace("\r", "").replace("\n", " ")
-        return text[:200] + "..." if len(text) > 200 else text
+        return str(description).strip().replace("\r", "").replace("\n", " ")
 
     def _canonical_media_url(self, fallback_url: str, info: dict) -> str:
         for value in (info.get("webpage_url"), info.get("original_url"), fallback_url):
@@ -633,8 +653,14 @@ class JmPlugin(Star):
             "noplaylist": True,
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 20,
+            "retries": 3,
             "max_filesize": self.video_max_size_bytes,
             "ffmpeg_location": imageio_ffmpeg.get_ffmpeg_exe(),
+            "http_headers": {
+                "User-Agent": self.http_user_agent,
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            },
         }
 
         try:
@@ -730,24 +756,18 @@ class JmPlugin(Star):
                 self._collect_light_app_url_candidates(item, candidates)
 
     def _normalize_video_url(self, url: str) -> str | None:
-        resolved = self._resolve_redirect_url(url)
-        if not self._is_video_platform_url(resolved):
-            return None
-        bilibili = self._normalize_bilibili_url(resolved)
-        return bilibili or resolved.split("#", 1)[0]
+        """规范化视频链接。
 
-    def _resolve_redirect_url(self, url: str) -> str:
-        request = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "AstrBot/astrbot_plugin_lyn"})
-        try:
-            with urllib.request.urlopen(request, timeout=10) as response:
-                return response.url
-        except (OSError, urllib.error.URLError):
-            request = urllib.request.Request(url, headers={"User-Agent": "AstrBot/astrbot_plugin_lyn"})
-            try:
-                with urllib.request.urlopen(request, timeout=10) as response:
-                    return response.url
-            except (OSError, urllib.error.URLError):
-                return url
+        除 B 站链接需要提前转为 BV 号外，其他平台直接把原链接交给 yt-dlp。
+        短链接（v.douyin.com、youtu.be 等）由 yt-dlp 自行跟随跳转，避免 urllib
+        提前跳转到风控页或非标准域名，导致抖音、YouTube 链接解析失败。
+        """
+        url = (url or "").strip()
+        if not self._is_video_platform_url(url):
+            return None
+
+        bilibili = self._normalize_bilibili_url(url)
+        return bilibili or url.split("#", 1)[0]
 
     def _is_video_platform_url(self, url: str) -> bool:
         host = urlparse(url).netloc.lower()
@@ -776,7 +796,7 @@ class JmPlugin(Star):
         return None
 
     def _extract_bilibili_bv_from_page(self, url: str) -> str | None:
-        request = urllib.request.Request(url, headers={"User-Agent": "AstrBot/astrbot_plugin_lyn"})
+        request = urllib.request.Request(url, headers={"User-Agent": self.http_user_agent})
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
                 body = response.read()
