@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse
 
 import astrbot.api.message_components as Comp
 import jmcomic
@@ -855,39 +855,23 @@ class JmPlugin(Star):
     def _normalize_video_url(self, url: str) -> str | None:
         """规范化视频链接。
 
-        B 站 b23.tv 短链先用 urllib 展开为 BV 链接，其他平台（v.douyin.com、
-        youtu.be 等）直接把原链接交给 yt-dlp 跟随跳转，避免 urllib 提前跳到
-        风控页或非标准域名导致解析失败。
+        b23.tv 短链和抖音、YouTube 等平台短链一样直接交给 yt-dlp 跟随跳转，
+        避免 urllib 提前展开后丢失分享参数、跳转到风控页或非标准域名导致解析失败。
+        bilibili.com 链接则规范化为 BV 链接，并保留 p/t 分 P 参数。
         """
         url = (url or "").strip()
         if not self._is_video_platform_url(url):
             return None
 
+        parsed = urlparse(url)
+        if self._is_domain(parsed.netloc, "b23.tv"):
+            return url.split("#", 1)[0]
+
         bilibili = self._normalize_bilibili_url(url)
         if bilibili:
             return bilibili
 
-        if self._is_bilibili_host(urlparse(url).netloc):
-            resolved = self._resolve_redirect_url(url)
-            if self._is_bilibili_host(urlparse(resolved).netloc):
-                resolved = resolved.split("#", 1)[0]
-                return self._normalize_bilibili_url(resolved) or resolved
-
         return url.split("#", 1)[0]
-
-    def _resolve_redirect_url(self, url: str) -> str:
-        for method in ("HEAD", "GET"):
-            request = urllib.request.Request(
-                url,
-                method=method,
-                headers={"User-Agent": self.http_user_agent},
-            )
-            try:
-                with urllib.request.urlopen(request, timeout=8) as response:
-                    return response.url
-            except (OSError, urllib.error.URLError):
-                continue
-        return url
 
     def _is_video_platform_url(self, url: str) -> bool:
         host = urlparse(url).netloc.lower()
@@ -903,7 +887,9 @@ class JmPlugin(Star):
 
         match = self.bilibili_bv_pattern.search(url)
         if match:
-            return f"https://www.bilibili.com/video/{match.group(0)}"
+            return self._with_bilibili_query(
+                f"https://www.bilibili.com/video/{match.group(0)}", parsed.query
+            )
 
         match = self.bilibili_av_pattern.search(url)
         if match:
@@ -912,8 +898,19 @@ class JmPlugin(Star):
                 or self._extract_bilibili_bv_with_ytdlp(url)
                 or self._av_to_bv(int(match.group(1)))
             )
-            return f"https://www.bilibili.com/video/{bv_id}"
+            return self._with_bilibili_query(
+                f"https://www.bilibili.com/video/{bv_id}", parsed.query
+            )
         return None
+
+    def _with_bilibili_query(self, base_url: str, query: str) -> str:
+        """只保留 B 站视频页的 p/t 参数，避免分享参数过长或丢失分 P 信息。"""
+        keep = [
+            (key, value)
+            for key, value in parse_qsl(query, keep_blank_values=True)
+            if key in {"p", "t"}
+        ]
+        return f"{base_url}?{urlencode(keep)}" if keep else base_url
 
     def _extract_bilibili_bv_from_page(self, url: str) -> str | None:
         request = urllib.request.Request(url, headers={"User-Agent": self.http_user_agent})
