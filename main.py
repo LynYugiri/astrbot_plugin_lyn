@@ -43,6 +43,7 @@ class JmPlugin(Star):
     pixiv_extensions = ("png", "jpg", "gif")
     video_max_size_bytes = 100 * 1024 * 1024
     media_parse_timeout_seconds = 20
+    media_summary_chunk_size = 1500
     video_url_pattern = re.compile(r"https?://[^\s\])}>\"'，。！？、；]+", re.IGNORECASE)
     bilibili_bv_pattern = re.compile(r"\bBV[0-9A-Za-z]{10}\b")
     bilibili_av_pattern = re.compile(r"(?:/video/av|\bav)(\d+)\b", re.IGNORECASE)
@@ -198,46 +199,45 @@ class JmPlugin(Star):
                 continue
 
             seen.add(summary[0])
-            content = []
-            if summary[1]:
-                content.append(Comp.Image.fromURL(summary[1]))
-            content.append(Comp.Plain(summary[0]))
-            nodes.append(
-                Comp.Node(
-                    uin=event.get_self_id() or "0",
-                    name="媒体解析",
-                    content=content,
+            for chunk_index, chunk in enumerate(self._split_summary_text(summary[0])):
+                content = []
+                if chunk_index == 0 and summary[1]:
+                    content.append(Comp.Image.fromURL(summary[1]))
+                content.append(Comp.Plain(chunk))
+                nodes.append(
+                    Comp.Node(
+                        uin=event.get_self_id() or "0",
+                        name="媒体解析",
+                        content=content,
+                    )
                 )
-            )
 
         if timeout_urls:
-            nodes.append(
-                Comp.Node(
-                    uin=event.get_self_id() or "0",
-                    name="媒体解析",
-                    content=[
-                        Comp.Plain(
-                            "\n".join(timeout_urls)
-                            + "\n媒体信息解析超时，已跳过，请稍后重试。"
-                        )
-                    ],
-                )
+            timeout_text = (
+                "\n".join(timeout_urls)
+                + "\n媒体信息解析超时，已跳过，请稍后重试。"
             )
+            for chunk in self._split_summary_text(timeout_text):
+                nodes.append(
+                    Comp.Node(
+                        uin=event.get_self_id() or "0",
+                        name="媒体解析",
+                        content=[Comp.Plain(chunk)],
+                    )
+                )
 
         if nodes:
-            # 直接调用平台发送接口，确保 aiocqhttp 走 send_group_forward_msg /
-            # send_private_forward_msg 生成聊天记录；失败时降级为普通消息。
+            # 把所有解析节点打包成一条合并转发聊天记录发送；
+            # 发送失败时直接降级为普通消息，避免 STOP 结果跳过 Respond 阶段。
             try:
-                await event.send(MessageChain(nodes))
+                await event.send(MessageChain([Comp.Nodes(nodes)]))
             except Exception as exc:
                 logger.warning(f"合并转发发送失败，已降级为普通消息: {exc}")
-                fallback = []
                 for node in nodes:
-                    fallback.extend(node.content)
-                result = event.chain_result(fallback)
-                result.stop_event()
-                yield result
-                return
+                    try:
+                        await event.send(MessageChain(node.content))
+                    except Exception as fallback_exc:
+                        logger.error(f"降级发送普通消息失败: {fallback_exc}")
             event.stop_event()
 
     def _lock_for(self, comic_id: int) -> asyncio.Lock:
@@ -538,21 +538,22 @@ class JmPlugin(Star):
         lines = [page_url, f"标题：{title}"]
         if category:
             lines.append(f"类型：{category}")
-        lines.extend([
-            f"UP：{uploader} | {uploader_url}" if uploader_url else f"UP：{uploader}",
-            "",
-            (
-                f"播放：{self._format_count(info.get('view_count'))} | "
-                f"弹幕：{self._format_count(info.get('danmaku_count') or info.get('comment_count_danmaku'))} | "
-                f"收藏：{self._format_count(info.get('favorite_count'))}"
-            ),
-            (
-                f"点赞：{self._format_count(info.get('like_count'))} | "
-                f"硬币：{self._format_count(info.get('coin_count'))} | "
-                f"评论：{self._format_count(info.get('comment_count'))}"
-            ),
-            f"简介：{description}",
-        ])
+        lines.append(
+            f"UP：{uploader} | {uploader_url}" if uploader_url else f"UP：{uploader}"
+        )
+
+        stat_line = " | ".join(
+            f"{label}：{self._format_count(value)}"
+            for label, value in (
+                ("播放", info.get("view_count")),
+                ("点赞", info.get("like_count")),
+                ("评论", info.get("comment_count")),
+            )
+            if value is not None
+        )
+        if stat_line:
+            lines.extend(["", stat_line])
+        lines.append(f"简介：{description}")
         return "\n".join(lines)
 
     def _media_cover_url(self, info: dict) -> str | None:
@@ -620,6 +621,36 @@ class JmPlugin(Star):
         if not description:
             return "无"
         return str(description).strip().replace("\r", "").replace("\n", " ")
+
+    def _split_summary_text(self, text: str) -> list[str]:
+        """把过长的媒体摘要拆成多条消息，尽量在换行处拆分。
+
+        超过 ``media_summary_chunk_size`` 的单行会按固定长度硬拆，
+        保证打包进合并转发时每条聊天记录都不会过长。
+        """
+        chunk_size = self.media_summary_chunk_size
+        lines = text.split("\n")
+        chunks = []
+        current = ""
+
+        for line in lines:
+            while len(line) > chunk_size:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.append(line[:chunk_size])
+                line = line[chunk_size:]
+
+            candidate = f"{current}\n{line}" if current else line
+            if current and len(candidate) > chunk_size:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+
+        if current:
+            chunks.append(current)
+        return chunks or [text]
 
     def _canonical_media_url(self, fallback_url: str, info: dict) -> str:
         for value in (info.get("webpage_url"), info.get("original_url"), fallback_url):
