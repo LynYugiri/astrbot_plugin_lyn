@@ -171,7 +171,7 @@ class JmPlugin(Star):
         async for result in self._download_video(event, url, as_file=False):
             yield result
 
-    @filter.event_message_type(filter.EventMessageType.ALL)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
     async def auto_convert_video_link(self, event: AstrMessageEvent):
         """自动解析视频平台链接或 QQ 小程序卡片，并回复媒体信息。"""
         if self._is_command_message(event.message_str):
@@ -752,28 +752,56 @@ class JmPlugin(Star):
 
     def _extract_light_app_urls(self, event: AstrMessageEvent) -> list[str]:
         raw_event = getattr(event.message_obj, "raw_message", None)
-        segments = getattr(raw_event, "message", None)
+        if isinstance(raw_event, dict):
+            segments = raw_event.get("message")
+            if segments is None:
+                segments = [raw_event]
+        else:
+            segments = getattr(raw_event, "message", None)
         if not isinstance(segments, list):
             return []
 
         urls = []
         for segment in segments:
+            if not isinstance(segment, dict):
+                continue
             if segment.get("type") not in {"json", "light_app"}:
                 continue
 
-            payload = segment.get("data", {}).get("json") or segment.get("data", {}).get("json_payload")
-            url = self._extract_url_from_light_app_payload(payload)
-            if url:
-                urls.append(url)
+            data = segment.get("data")
+            if not isinstance(data, dict):
+                data = {}
+            payloads = (
+                data.get("json"),
+                data.get("json_payload"),
+                data.get("data"),
+                data.get("content"),
+                data.get("meta"),
+                data,
+            )
+            for payload in payloads:
+                if not payload:
+                    continue
+                url = self._extract_url_from_light_app_payload(payload)
+                if url:
+                    urls.append(url)
+                    break
         return urls
 
     def _extract_url_from_light_app_payload(self, payload: object) -> str | None:
         if not payload:
             return None
-        try:
-            data = json.loads(payload) if isinstance(payload, str) else payload
-        except (TypeError, json.JSONDecodeError):
-            return None
+
+        if isinstance(payload, str):
+            for url in self._extract_urls_from_text(payload):
+                if self._is_video_platform_url(url):
+                    return url
+            try:
+                data = json.loads(payload)
+            except (TypeError, json.JSONDecodeError):
+                return None
+        else:
+            data = payload
 
         candidates = []
         self._collect_light_app_url_candidates(data, candidates)
