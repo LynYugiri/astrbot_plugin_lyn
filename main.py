@@ -42,6 +42,7 @@ class JmPlugin(Star):
     pixiv_forward_chunk_size = 42
     pixiv_extensions = ("png", "jpg", "gif")
     video_max_size_bytes = 100 * 1024 * 1024
+    media_parse_timeout_seconds = 20
     video_url_pattern = re.compile(r"https?://[^\s\])}>\"'，。！？、；]+", re.IGNORECASE)
     bilibili_bv_pattern = re.compile(r"\bBV[0-9A-Za-z]{10}\b")
     bilibili_av_pattern = re.compile(r"(?:/video/av|\bav)(\d+)\b", re.IGNORECASE)
@@ -182,8 +183,17 @@ class JmPlugin(Star):
 
         nodes = []
         seen = set()
+        timeout_urls = []
         for raw_url in raw_urls:
-            summary = await asyncio.to_thread(self._describe_media_url, raw_url)
+            try:
+                summary = await asyncio.wait_for(
+                    asyncio.to_thread(self._describe_media_url, raw_url),
+                    timeout=self.media_parse_timeout_seconds,
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                logger.warning(f"媒体解析超时，已跳过: {raw_url}")
+                timeout_urls.append(raw_url)
+                continue
             if not summary or summary[0] in seen:
                 continue
 
@@ -200,10 +210,35 @@ class JmPlugin(Star):
                 )
             )
 
+        if timeout_urls:
+            nodes.append(
+                Comp.Node(
+                    uin=event.get_self_id() or "0",
+                    name="媒体解析",
+                    content=[
+                        Comp.Plain(
+                            "\n".join(timeout_urls)
+                            + "\n媒体信息解析超时，已跳过，请稍后重试。"
+                        )
+                    ],
+                )
+            )
+
         if nodes:
-            # 直接发送 Node 组件链。aiocqhttp 适配器会为每个 Node 调用
-            # send_group_forward_msg / send_private_forward_msg，生成聊天记录。
-            yield event.chain_result(nodes)
+            # 直接调用平台发送接口，确保 aiocqhttp 走 send_group_forward_msg /
+            # send_private_forward_msg 生成聊天记录；失败时降级为普通消息。
+            try:
+                await event.send(MessageChain(nodes))
+            except Exception as exc:
+                logger.warning(f"合并转发发送失败，已降级为普通消息: {exc}")
+                fallback = []
+                for node in nodes:
+                    fallback.extend(node.content)
+                result = event.chain_result(fallback)
+                result.stop_event()
+                yield result
+                return
+            event.stop_event()
 
     def _lock_for(self, comic_id: int) -> asyncio.Lock:
         lock = self._download_locks.get(comic_id)
@@ -463,8 +498,9 @@ class JmPlugin(Star):
             "nocheckcertificate": True,
             "noplaylist": True,
             "skip_download": True,
-            "socket_timeout": 20,
-            "retries": 3,
+            "socket_timeout": 10,
+            "retries": 1,
+            "extractor_retries": 1,
             "http_headers": {
                 "User-Agent": self.http_user_agent,
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -760,16 +796,39 @@ class JmPlugin(Star):
     def _normalize_video_url(self, url: str) -> str | None:
         """规范化视频链接。
 
-        除 B 站链接需要提前转为 BV 号外，其他平台直接把原链接交给 yt-dlp。
-        短链接（v.douyin.com、youtu.be 等）由 yt-dlp 自行跟随跳转，避免 urllib
-        提前跳转到风控页或非标准域名，导致抖音、YouTube 链接解析失败。
+        B 站 b23.tv 短链先用 urllib 展开为 BV 链接，其他平台（v.douyin.com、
+        youtu.be 等）直接把原链接交给 yt-dlp 跟随跳转，避免 urllib 提前跳到
+        风控页或非标准域名导致解析失败。
         """
         url = (url or "").strip()
         if not self._is_video_platform_url(url):
             return None
 
         bilibili = self._normalize_bilibili_url(url)
-        return bilibili or url.split("#", 1)[0]
+        if bilibili:
+            return bilibili
+
+        if self._is_bilibili_host(urlparse(url).netloc):
+            resolved = self._resolve_redirect_url(url)
+            if self._is_bilibili_host(urlparse(resolved).netloc):
+                resolved = resolved.split("#", 1)[0]
+                return self._normalize_bilibili_url(resolved) or resolved
+
+        return url.split("#", 1)[0]
+
+    def _resolve_redirect_url(self, url: str) -> str:
+        for method in ("HEAD", "GET"):
+            request = urllib.request.Request(
+                url,
+                method=method,
+                headers={"User-Agent": self.http_user_agent},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=8) as response:
+                    return response.url
+            except (OSError, urllib.error.URLError):
+                continue
+        return url
 
     def _is_video_platform_url(self, url: str) -> bool:
         host = urlparse(url).netloc.lower()
